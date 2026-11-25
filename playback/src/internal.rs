@@ -920,6 +920,10 @@ pub struct InternalLog {
     pub failure: Option<UnavailableReason>,
     /// Whether the answer of a pending request already carried this failure to its requester.
     pub answered: bool,
+    /// Whether the failure of one track advances playback to another, continuing the chain that
+    /// tells the user once. A chain continuation is already told by the failure that started it:
+    /// one user-facing failure report per track skipped would bury the one that matters.
+    pub chain_continuation: bool,
 }
 
 impl<S> Source for SharedSource<S>
@@ -1013,6 +1017,10 @@ pub(crate) struct PlayerInternal {
     // An interruption paused playback, so playback goes on when the interruption ends. A play,
     // or a track that starts playing, settles it first.
     resume_after_interruption: bool,
+    // A failure advancing through the queue already told the user once, so the failures that
+    // follow it in the same chain are chain continuations. A load that reaches its track ends
+    // the chain, as does one that does not advance it.
+    failure_chain_signaled: bool,
     unavailable: HashMap<PlayingItem, UnavailableReason>,
     // Where outputs come from, and how they stop and start again.
     outputs: Arc<dyn Outputs>,
@@ -1087,6 +1095,7 @@ impl PlayerInternal {
             listen: ListenProgress::default(),
             listen_continues: false,
             resume_after_interruption: false,
+            failure_chain_signaled: false,
             unavailable: HashMap::new(),
             outputs,
             host_bridge: Arc::new(RwLock::new(None)),
@@ -1170,6 +1179,7 @@ impl PlayerInternal {
                             self.debounce_timer = None;
                             self.send_playlist_updated()?;
                             self.set_playback_mode(mode)?;
+                            self.failure_chain_signaled = false;
                             self.load_at(index, false, false, Some(position))?;
                         },
                         PlayerCommand::RestoreTagged { entries, index, position, mode } => {
@@ -1187,6 +1197,7 @@ impl PlayerInternal {
                             self.playback_strategy.on_playlist_updated(self.playlist.len(), UpdateReason::AddToPlaylist { mode: AddMode::AppendToEnd, index: None, count: self.playlist.len() });
                             self.send_playlist_updated()?;
                             self.set_playback_mode(mode)?;
+                            self.failure_chain_signaled = false;
                             self.load_at(index, false, false, Some(position))?;
                         },
                         PlayerCommand::Load { index } => {
@@ -1200,6 +1211,7 @@ impl PlayerInternal {
                             if index < self.playlist.len() {
                                 self.clear_unavailable(Some(self.playlist[index].item.clone()))?;
                             }
+                            self.failure_chain_signaled = false;
                             self.load_at(Some(index), play, false, Some(position))?;
                         },
                         PlayerCommand::LoadComplete { generation, result, item, original_item, path } => {
@@ -1216,6 +1228,9 @@ impl PlayerInternal {
                                 self.complete_load_completions(Err(PlayerCommandError::Superseded));
                                 self.active_load_completions = pending.completions;
                                 let (index, mapped) = self.cursor_for_position(pending.position.playlist_index, pending.position.mapped);
+                                // The pending load answers a newer request the user made, so it
+                                // starts over rather than continue the chain it interrupts.
+                                self.failure_chain_signaled = false;
                                 self.load_at(Some(index), pending.play, mapped, pending.restore_position)?;
                                 continue;
                             }
@@ -1234,6 +1249,7 @@ impl PlayerInternal {
                             };
                             match result {
                                 Ok(source) => {
+                                    self.failure_chain_signaled = false;
                                     if let Some(entry) = self.playlist.get_mut(playlist_index)
                                         && entry.item == original_item && entry.item != item
                                     {
@@ -1265,26 +1281,35 @@ impl PlayerInternal {
                                     error!("Failed to load track: {e:?}");
                                     self.restore_position = None;
                                     let reason = UnavailableReason::classify(&e);
+                                    // The failure of one track of a queue advances playback to
+                                    // the next, so the scan answers whether playback still stops.
+                                    let next = self.find_available_after(playlist_index);
                                     // Discarded completions (restore at startup) count as
                                     // unanswered: nobody waits on them, so their failure must
-                                    // still reach the listeners.
+                                    // still reach the listeners. One chain of failures tells the
+                                    // user once, at its first failure.
                                     let answered = self
                                         .active_load_completions
                                         .iter()
                                         .any(|completion| !completion.response.is_closed());
+                                    let chain_continuation =
+                                        next.is_some() && self.failure_chain_signaled;
+                                    // Whether or not a request answer carries this failure, the
+                                    // user is told: the chain is told once, by either route.
+                                    self.failure_chain_signaled = true;
                                     self.event_sender.send(PlayerEvent::Log(InternalLog {
                                         domain: "playback".into(),
                                         error: format!("failed to load the track: {e:#}"),
                                         item: Some(item.clone()),
                                         failure: Some(reason),
                                         answered,
+                                        chain_continuation,
                                     }))?;
                                     self.mark_unavailable(&item, reason, refused_by);
                                     self.event_sender.send(PlayerEvent::Unavailable(item, reason))?;
                                     self.complete_load_completions(Err(PlayerCommandError::SourceUnavailable));
                                     // Advance from the failed load, including when no track has loaded yet.
-                                    let next = self.find_available_after(playlist_index);
-                                    if let Some(next) = next { self.load(Some(next), play, true)?; }
+                                    if let Some(next) = next { self.load_chain(Some(next), play)?; }
                                     else { self.stop()?; self.event_sender.send(PlayerEvent::EndOfPlaylist)?; }
                                 }
                             }
@@ -1531,7 +1556,26 @@ impl PlayerInternal {
     }
 
     fn load(&mut self, index: Option<usize>, play: bool, mapped: bool) -> Result<()> {
+        // A load that does not continue a failure chain starts over: the chain is told once, so
+        // it ends wherever playback leaves it.
+        self.failure_chain_signaled = false;
         self.load_at(index, play, mapped, None)
+    }
+
+    // A load that advances the chain of failures playback already told the user once. Only the
+    // first failure of the chain is told again when no request answers carry it: each track the
+    // chain skips would tell the user otherwise, one report per skipped track.
+    fn load_chain(&mut self, index: Option<usize>, play: bool) -> Result<()> {
+        self.load_chained(index, play)
+    }
+
+    fn load_chained(&mut self, index: Option<usize>, play: bool) -> Result<()> {
+        // `load_at` ends the failure chain for every load that does not continue it, so this
+        // raises the chain again around the one call that does.
+        let chain = self.failure_chain_signaled;
+        let result = self.load_at(index, play, true, None);
+        self.failure_chain_signaled = chain;
+        result
     }
 
     // Whether playback plays, or starts once the track that is loading is ready.
@@ -2294,6 +2338,7 @@ impl PlayerInternal {
             return self.stop();
         };
         info!("Opening the audio output again at {position:?}");
+        self.failure_chain_signaled = false;
         let result = self.load_at(Some(index), true, mapped, Some(position));
         if result.is_ok() {
             self.listen_continues = true;
@@ -2930,19 +2975,25 @@ impl PlayerInternal {
                     // No pending request carries this failure: playback was already underway, so
                     // the log is what keeps it visible. It must precede the stop, after which the
                     // player no longer names the track.
+                    // The failure of one track of a queue advances playback to the next, so the
+                    // scan answers whether playback still stops.
+                    let next = self.find_available_after(failed_index);
+                    let chain_continuation = next.is_some() && self.failure_chain_signaled;
+                    self.failure_chain_signaled = true;
                     self.event_sender.send(PlayerEvent::Log(InternalLog {
                         domain: "playback".into(),
                         error: "the audio stream failed during playback".into(),
                         item: Some(item.clone()),
                         failure: Some(reason),
                         answered: false,
+                        chain_continuation,
                     }))?;
                     self.stop()?;
                     self.mark_unavailable(&item, reason, None);
                     self.event_sender
                         .send(PlayerEvent::Unavailable(item, reason))?;
-                    if let Some(next) = self.find_available_after(failed_index) {
-                        self.load(Some(next), true, true)?;
+                    if let Some(next) = next {
+                        self.load_chain(Some(next), true)?;
                     } else {
                         self.event_sender.send(PlayerEvent::EndOfPlaylist)?;
                     }
@@ -4118,7 +4169,7 @@ impl PlayerInternal {
             return Ok(());
         }
         if let Some(next) = self.find_available_after(failed_index) {
-            self.load(Some(next), play, true)?;
+            self.load_chain(Some(next), play)?;
         } else {
             self.event_sender.send(PlayerEvent::EndOfPlaylist)?;
         }
